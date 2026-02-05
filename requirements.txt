@@ -46,3 +46,4 @@ pytest-asyncio>=0.24.0
 
 # Standard library (no install needed, listed for documentation)
 # sqlite3, hashlib, pathlib, re, json, datetime, urllib.parse, typing, contextlib
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
