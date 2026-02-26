@@ -44,5 +44,21 @@ pytest>=8.3.0
 pytest-httpserver>=1.1.0
 pytest-asyncio>=0.24.0
 
+# LM Studio OpenAI-compatible client
+langchain-openai>=0.2.0
+
+# Embeddings/Vector
+chromadb>=0.5.5
+sentence-transformers>=2.2.2
+
+# Formatting/Linting
+mdformat>=0.7.17
+
+# Feeds
+feedparser>=6.0.11
+
+# Orchestration (stubs for future)
+langgraph>=0.2.27
+
 # Standard library (no install needed, listed for documentation)
 # sqlite3, hashlib, pathlib, re, json, datetime, urllib.parse, typing, contextlib

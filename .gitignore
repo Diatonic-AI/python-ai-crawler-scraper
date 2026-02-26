@@ -81,3 +81,9 @@ site/
 .cache/
 tmp/
 temp/
+
+# Added by repo-migrator for safety
+credentials
+node_modules/
+*.pyc
+target/

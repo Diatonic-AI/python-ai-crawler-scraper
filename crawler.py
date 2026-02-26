@@ -6,7 +6,7 @@ rate limiting, and robust error handling.
 
 import time
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 from collections import deque
 from typing import Set, List, Dict, Optional, Tuple
 import tldextract
@@ -18,6 +18,7 @@ from tenacity import (
 )
 from config import CrawlerConfig
 from database import CrawlerDatabase
+from robots_parser import RobotsPolicy
 
 
 class WebCrawler:
@@ -53,6 +54,14 @@ class WebCrawler:
         
         # Domain filtering
         self.allowed_domains_set = set(config.ALLOWED_DOMAINS) if config.ALLOWED_DOMAINS else None
+
+        # Robots policy and per-host delay tracking
+        self.robots = RobotsPolicy(
+            user_agent=config.USER_AGENT,
+            fallback_delay=config.ROBOTS_FALLBACK_DELAY,
+            enabled=config.ROBOTS_OBEY,
+        )
+        self._last_fetch_by_host: Dict[str, float] = {}
     
     def initialize(self, seed_urls: List[str]):
         """
@@ -75,33 +84,42 @@ class WebCrawler:
                 self.queue.append((normalized_url, 0))
                 self.seen_urls.add(normalized_url)
                 print(f"🌱 Added seed URL: {normalized_url}")
+        
+        # Optional: discover additional URLs from sitemaps/feeds
+        try:
+            from discovery_module import discover_urls
+            for url in seed_urls:
+                for durl in discover_urls(url)[:50]:  # limit to avoid explosion
+                    nu = self._normalize_url(durl)
+                    if nu and nu not in self.seen_urls and self._is_allowed_domain(nu):
+                        self.queue.append((nu, 1))
+                        self.seen_urls.add(nu)
+        except Exception:
+            pass
     
     def _normalize_url(self, url: str) -> Optional[str]:
         """
-        Normalize URL by removing fragments and trailing slashes.
-        
-        Args:
-            url: URL to normalize
-        
-        Returns:
-            Normalized URL or None if invalid
+        Normalize URL by removing fragments, stripping tracking params, and trailing slashes.
         """
         try:
-            parsed = urlparse(url)
-            
-            # Remove fragment
-            normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            
-            # Add query string if present
-            if parsed.query:
-                normalized += f"?{parsed.query}"
-            
-            # Remove trailing slash (except for root)
-            if normalized.endswith('/') and len(parsed.path) > 1:
-                normalized = normalized[:-1]
-            
+            p = urlparse(url)
+            # strip fragment
+            path = p.path
+            query = p.query
+            # optionally strip tracking params
+            if self.config.STRIP_TRACKING_PARAMS and query:
+                pairs = []
+                for k, v in parse_qsl(query, keep_blank_values=True):
+                    lk = k.lower()
+                    if lk.startswith("utm_") or lk in {"fbclid", "gclid"}:
+                        continue
+                    pairs.append((k, v))
+                query = urlencode(pairs, doseq=True)
+            # remove trailing slash except root
+            if path.endswith("/") and len(path) > 1:
+                path = path[:-1]
+            normalized = urlunparse((p.scheme, p.netloc, path, "", query, ""))
             return normalized
-        
         except Exception as e:
             print(f"⚠️  Failed to normalize URL {url}: {e}")
             return None
@@ -143,21 +161,18 @@ class WebCrawler:
         parsed = urlparse(url)
         path = parsed.path.lower()
         
+        # Enforce optional docs path prefix restriction
+        docs_prefix = (self.config.DOCS_PATH_PREFIX or "").lower().strip()
+        if docs_prefix and not path.startswith(docs_prefix):
+            return True, f"outside docs prefix: {docs_prefix}"
+        
         # Check file extensions
         for ext in self.config.SKIP_EXTENSIONS:
             if path.endswith(ext):
                 return True, f"Binary/media file: {ext}"
         
         # Skip common non-content paths
-        skip_patterns = [
-            '/api/', '/ajax/', '/json/', '/xml/',
-            '/login', '/signin', '/signup', '/register',
-            '/logout', '/auth/', '/oauth/',
-            '/admin/', '/wp-admin/',
-            '/feed/', '/rss/', '/atom/'
-        ]
-        
-        for pattern in skip_patterns:
+        for pattern in self.config.SKIP_PATH_PATTERNS:
             if pattern in path:
                 return True, f"Non-content path: {pattern}"
         
@@ -169,22 +184,25 @@ class WebCrawler:
         retry=retry_if_exception_type((requests.RequestException, requests.Timeout))
     )
     def _fetch_url(self, url: str) -> Optional[requests.Response]:
-        """
-        Fetch URL content with retry logic.
-        
-        Args:
-            url: URL to fetch
-        
-        Returns:
-            Response object or None if fetch failed
-        """
+        """Fetch URL content with retry logic and polite delays."""
         try:
+            # Polite per-host delay (robots or configured)
+            host = urlparse(url).netloc
+            robots_delay = self.robots.get_crawl_delay(url) if self.robots.enabled else 0.0
+            delay = max(self.config.REQUEST_DELAY, robots_delay or 0.0)
+            last = self._last_fetch_by_host.get(host, 0.0)
+            if delay and last:
+                to_sleep = delay - max(0.0, time.time() - last)
+                if to_sleep > 0:
+                    time.sleep(to_sleep)
+
             response = self.session.get(
                 url,
                 timeout=self.config.REQUEST_TIMEOUT,
                 allow_redirects=True,
-                stream=True  # Stream to check content size before downloading
+                stream=True,
             )
+            self._last_fetch_by_host[host] = time.time()
             
             # Check content type
             content_type = response.headers.get('Content-Type', '').lower()
@@ -202,15 +220,12 @@ class WebCrawler:
             response.raise_for_status()
             
             return response
-        
         except requests.Timeout:
             print(f"⏱️  Timeout fetching {url}")
             raise
-        
         except requests.RequestException as e:
             print(f"❌ Request error fetching {url}: {e}")
             raise
-        
         except Exception as e:
             print(f"❌ Unexpected error fetching {url}: {e}")
             return None
@@ -234,6 +249,11 @@ class WebCrawler:
         
         # Fetch URL
         try:
+            # Robots.txt allow check
+            if self.robots.enabled and not self.robots.is_allowed(url):
+                print(f"⏭️  Disallowed by robots.txt: {url}")
+                return None
+
             response = self._fetch_url(url)
             
             if not response:

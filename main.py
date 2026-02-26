@@ -14,6 +14,10 @@ from crawler import WebCrawler
 from content_processor import ContentProcessor
 from llm_normalizer import LLMNormalizer
 from obsidian_writer import ObsidianWriter
+from embeddings_manager import EmbeddingsManager
+from semantic_linker import build_semantic_links
+from markdown_linter import lint_and_format
+from link_validator import validate_internal_wikilinks, validate_external_links, find_wikilinks
 
 
 def parse_args():
@@ -52,6 +56,36 @@ def parse_args():
         action='store_true',
         help='Resume previous crawl from database'
     )
+
+    parser.add_argument(
+        '--use-langgraph',
+        action='store_true',
+        help='Run the pipeline via LangGraph orchestration'
+    )
+
+    parser.add_argument(
+        '--vault-dir',
+        type=str,
+        help='Override Obsidian vault output directory'
+    )
+
+    parser.add_argument(
+        '--allowed-domains',
+        nargs='+',
+        help='Restrict crawl to these domains'
+    )
+
+    parser.add_argument(
+        '--docs-prefix',
+        type=str,
+        help='Restrict docs discovery to URLs with this path prefix (e.g., /api-reference)'
+    )
+
+    parser.add_argument(
+        '--full-docs',
+        action='store_true',
+        help='Discover all documentation URLs under the given seed (docs mode)'
+    )
     
     return parser.parse_args()
 
@@ -63,7 +97,7 @@ def process_pages(db: EnhancedCrawlerDatabase, llm_normalizer: LLMNormalizer = N
     Args:
         db: Database instance
         llm_normalizer: LLM normalizer instance (optional)
-        use_llm: Whether to use LLM for title improvement
+        use_llm: Whether to use LLM for enhancement
     """
     print("\n📝 Processing crawled pages...")
     
@@ -82,27 +116,53 @@ def process_pages(db: EnhancedCrawlerDatabase, llm_normalizer: LLMNormalizer = N
         
         # Extract clean content
         processed = ContentProcessor.extract_content(html_content, url)
+        metadata = {'tags': [CrawlerConfig.TAG_PREFIX]}
+        summary = ''
+        page_type = ''
+        lang = 'en'
         
-        # Improve title with LLM if enabled
+        # LLM enrichment if enabled
         if use_llm and llm_normalizer:
             try:
                 improved_title = llm_normalizer.improve_title(
-                    processed['title'], 
-                    processed['content'][:500]
+                    processed['title'], processed['content'][:500]
                 )
                 processed['title'] = improved_title
-                
-                # Extract tags
-                tags = llm_normalizer.extract_tags(
-                    improved_title,
-                    processed['content']
-                )
-                processed['metadata'] = {'tags': tags}
+                metadata['tags'] = llm_normalizer.extract_tags(improved_title, processed['content'])
+                summary = llm_normalizer.summarize(improved_title, processed['content'])
+                page_type, lang = llm_normalizer.classify(improved_title, processed['content'])
             except Exception as e:
                 print(f"⚠️  LLM processing failed for {url}: {e}")
-                processed['metadata'] = {'tags': [CrawlerConfig.TAG_PREFIX]}
-        else:
-            processed['metadata'] = {'tags': [CrawlerConfig.TAG_PREFIX]}
+        
+        processed['metadata'] = metadata
+
+        # Markdown lint/format (non-blocking)
+        md_formatted, lint_notes = lint_and_format(processed['markdown_content'])
+        processed['markdown_content'] = md_formatted
+
+        # Build embeddings and semantic links (best-effort)
+        semantic_similar = []
+        try:
+            em = EmbeddingsManager(CrawlerConfig)
+            doc_id = processed['slug']
+            em.upsert_page(doc_id, processed['content'], metadata={"url": url})
+            semantic_similar = build_semantic_links(CrawlerConfig, doc_id, processed['content'])
+        except Exception as e:
+            print(f"⚠️  Embeddings/semantic failed for {url}: {e}")
+
+        # Link validation (best-effort)
+        missing_internal = []
+        external_errors = []
+        try:
+            existing_slugs = set(db.get_all_slugs()) if hasattr(db, 'get_all_slugs') else set()
+            missing_internal = validate_internal_wikilinks(processed['markdown_content'], existing_slugs)
+            # crude external URL extraction
+            import re
+            ext_urls = re.findall(r"https?://[^\s)>'\]\"]+", processed['markdown_content'])
+            ext_result = validate_external_links(ext_urls[:50], timeout=CrawlerConfig.EXTERNAL_LINK_TIMEOUT, retries=CrawlerConfig.EXTERNAL_LINK_RETRIES)
+            external_errors = [f"{u} -> {code}" for u, code in ext_result.items() if code >= 400 or code == 0]
+        except Exception as e:
+            print(f"⚠️  Link validation failed for {url}: {e}")
         
         # Update database
         page_data = {
@@ -114,8 +174,16 @@ def process_pages(db: EnhancedCrawlerDatabase, llm_normalizer: LLMNormalizer = N
             'content_hash': processed['checksum'],
             'depth': page['crawl_depth'],
             'metadata': processed['metadata'],
-            'status': 'processed'
+            'status': 'processed',
+            'summary': summary,
+            'type': page_type,
+            'lang': lang,
+            'semantic_similar': semantic_similar,
+            'missing_internal_links': missing_internal,
+            'external_link_errors': external_errors,
         }
+        if lint_notes:
+            page_data['metadata']['lint_notes'] = lint_notes
         
         # Use enhanced upsert method
         db.upsert_page_enhanced(url, page_data)
@@ -178,6 +246,12 @@ def main():
     if args.max_depth:
         CrawlerConfig.MAX_DEPTH = args.max_depth
     
+    # Apply optional overrides before validation
+    if args.vault_dir:
+        CrawlerConfig.VAULT_DIR = Path(args.vault_dir)
+    if args.allowed_domains:
+        CrawlerConfig.ALLOWED_DOMAINS = args.allowed_domains
+
     # Validate configuration
     if not CrawlerConfig.validate():
         print("❌ Invalid configuration. Please check your .env file or CLI args.")
@@ -185,7 +259,27 @@ def main():
     
     # Display configuration
     CrawlerConfig.display()
-    
+
+    # Optional LangGraph path
+    if args.use_langgraph:
+        try:
+            from orchestrator import run_with_langgraph
+            result = run_with_langgraph(
+                seeds=CrawlerConfig.SEED_URLS,
+                max_pages=CrawlerConfig.MAX_PAGES,
+                max_depth=CrawlerConfig.MAX_DEPTH,
+                skip_llm=args.skip_llm,
+                resume=args.resume,
+                vault_dir=str(CrawlerConfig.VAULT_DIR),
+                allowed_domains=CrawlerConfig.ALLOWED_DOMAINS,
+                docs_prefix=args.docs_prefix,
+                full_docs=args.full_docs,
+            )
+            print(f"\n✅ Pipeline completed ({result.get('mode')}). Processed={result.get('processed', 0)}, Written={result.get('written', 0)}")
+            return 0
+        except Exception as e:
+            print(f"⚠️  LangGraph execution failed: {e}. Falling back to sequential mode…")
+
     # Initialize enhanced database with frontier, entities, and LLM tracking
     print(f"\n🗄️  Initializing enhanced database: {CrawlerConfig.DATABASE_PATH}")
     db = EnhancedCrawlerDatabase(CrawlerConfig.DATABASE_PATH)
@@ -196,8 +290,8 @@ def main():
     llm_normalizer = None
     if not args.skip_llm:
         try:
-            print("🤖 Initializing LLM normalizer...")
-            llm_normalizer = LLMNormalizer(CrawlerConfig)
+            print("🤖 Initializing LLM normalizer (LM Studio)...")
+            llm_normalizer = LLMNormalizer(CrawlerConfig, db=db)
             print("✅ LLM ready")
         except Exception as e:
             print(f"⚠️  LLM initialization failed: {e}")
