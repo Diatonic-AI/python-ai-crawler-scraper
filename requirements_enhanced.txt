@@ -47,3 +47,4 @@ tqdm==4.66.5
 
 # Utilities
 colorama==0.4.6
+urllib3>=2.6.3 # not directly required, pinned by Snyk to avoid a vulnerability
